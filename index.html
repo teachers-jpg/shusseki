@@ -32,16 +32,26 @@
   #start { font-size:22px; padding:18px 36px; border:0; border-radius:14px; background:var(--info); color:#fff; font-weight:700; }
   #status { position:fixed; left:0; right:0; bottom:0; padding:4px 12px; font-size:12px; color:var(--muted); background:rgba(0,0,0,.3); }
   canvas { display:none; }
+  #modes { display:flex; gap:6px; background:#0f172a; padding:4px; border-radius:12px; }
+  #modes button { font-size:20px; font-weight:700; padding:8px 22px; border:0; border-radius:9px; background:transparent; color:var(--muted); }
+  #modes button.on.in  { background:var(--ok);  color:#fff; }
+  #modes button.on.out { background:#8b5cf6; color:#fff; }
+  #flip { position:absolute; top:10px; right:10px; z-index:2; font-size:14px; padding:8px 12px; border:0; border-radius:10px; background:rgba(255,255,255,.2); color:#fff; backdrop-filter:blur(4px); }
+  video.mirror { transform:scaleX(-1); }
+  #panel.out { background:#8b5cf6; } #panel.early { background:var(--late); }
+  #panel.out, #panel.early { color:#fff; }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
     <h1>大智国際ビジネス専門学校　出席打刻</h1>
+    <div id="modes"><button class="in" data-mode="in">登校</button><button class="out" data-mode="out">下校</button></div>
     <div id="clock"><small></small>--:--</div>
   </header>
   <main>
     <div id="camwrap">
+      <button id="flip" title="カメラ切替">🔄 カメラ切替</button>
       <video id="video" playsinline muted autoplay></video>
       <div id="frame"><div></div></div>
       <div id="guide">QRコードを枠の中に入れてください</div>
@@ -10167,7 +10177,17 @@ const COOLDOWN_MS = 8000;   // 同じQRを続けて読んだときに無視す�
 
 const video = document.getElementById('video'), canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d', { willReadFrequently: true });
 const panel = document.getElementById('panel'), result = document.getElementById('result'), status = document.getElementById('status');
-let lastNo = '', lastAt = 0, busy = false, audio;
+let lastNo = '', lastAt = 0, busy = false, audio, stream = null;
+let mode = 'in', facing = 'user';          // 内カメラ(user) / 外カメラ(environment)
+try { mode = localStorage.getItem('mode') || 'in'; facing = localStorage.getItem('facing') || 'user'; } catch (e) {}
+function setMode(m) {
+  mode = m; try { localStorage.setItem('mode', m); } catch (e) {}
+  document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  document.getElementById('guide').textContent = (m === 'in' ? '【登校】' : '【下校】') + ' QRコードを枠の中に入れてください';
+  lastNo = '';
+}
+document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => { beep('info'); setMode(b.dataset.mode); }));
+setMode(mode);
 
 // 時計
 function tick() {
@@ -10181,7 +10201,7 @@ setInterval(tick, 1000); tick();
 function beep(kind) {
   try {
     audio = audio || new (window.AudioContext || window.webkitAudioContext)();
-    const seq = { ok:[[880,.12],[1320,.18]], late:[[660,.15],[440,.3]], ng:[[220,.4]], info:[[660,.12]] }[kind] || [];
+    const seq = { ok:[[880,.12],[1320,.18]], late:[[660,.15],[440,.3]], out:[[1320,.12],[880,.18]], early:[[660,.15],[440,.3]], ng:[[220,.4]], info:[[660,.12]] }[kind] || [];
     let t = audio.currentTime;
     seq.forEach(([f, d]) => { const o = audio.createOscillator(), g = audio.createGain(); o.frequency.value = f; o.type = 'sine'; g.gain.value = .25; o.connect(g); g.connect(audio.destination); o.start(t); o.stop(t + d); t += d + .04; });
   } catch (e) {}
@@ -10199,9 +10219,10 @@ async function send(no) {
   busy = true;
   show('info', '…', '確認中', no);
   try {
-    const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ no, token: TOKEN }) });
+    const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ no, token: TOKEN, mode }) });
     const j = await r.json();
-    if (j.status === 'recorded')      show(j.judge === '出席' ? 'ok' : 'late', j.judge, j.name, `${j.cls}　${j.time}`);
+    const kindOf = { '出席':'ok', '遅刻':'late', '下校':'out', '早退':'early' };
+    if (j.status === 'recorded')      show(kindOf[j.judge] || 'ok', j.judge, j.name, `${j.cls}　${j.time}`);
     else if (j.status === 'already')  show('info', '記録済み', j.name, `${j.cls}　${j.time} ${j.judge}`);
     else if (j.status === 'unknown')  show('ng', '登録なし', no, '先生に伝えてください');
     else                              show('ng', 'エラー', '', j.message || '');
@@ -10225,13 +10246,23 @@ function scan() {
   requestAnimationFrame(scan);
 }
 
+async function openCamera() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  video.srcObject = stream; await video.play();
+  video.classList.toggle('mirror', facing === 'user');
+  status.textContent = 'カメラ動作中（' + (facing === 'user' ? '内カメラ' : '外カメラ') + '）';
+}
+document.getElementById('flip').addEventListener('click', async () => {
+  facing = (facing === 'user') ? 'environment' : 'user';
+  try { localStorage.setItem('facing', facing); } catch (e) {}
+  try { await openCamera(); } catch (e) { status.textContent = 'カメラ切替に失敗: ' + e.message; }
+});
 async function start() {
   try {
     beep('info');
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-    video.srcObject = stream; await video.play();
+    await openCamera();
     show('', '', '', '');
-    status.textContent = 'カメラ動作中';
     requestAnimationFrame(scan);
   } catch (e) {
     status.textContent = 'カメラを開けません: ' + e.message;
